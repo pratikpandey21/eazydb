@@ -21,6 +21,7 @@ struct Data {
 enum Request {
     Write { key: String, value: String },
     Read { key: String },
+    Print {}
 }
 
 enum Message {
@@ -31,29 +32,36 @@ enum Message {
 type Database = HashMap<String, Data>;
 
 static CLIENT_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 fn init_nodes(num_nodes: usize, response_sender: Sender<(usize, String)>, ring: Arc<Mutex<FxHashMap<u64, usize>>>) -> Vec<Sender<Message>> {
     println!("Initializing {} nodes", num_nodes);
+    let shared_senders = Arc::new(Mutex::new(vec![]));
     let mut senders = vec![];
     for id in 0..num_nodes {
         let (tx, rx) = mpsc::channel();
         let version_vector = Arc::new(Mutex::new(HashMap::new()));
+
+        {
+            let mut senders_lock = shared_senders.lock().unwrap();
+            senders_lock.push(tx.clone());
+        }
+
         let tx_clone = tx.clone();
+        senders.push(tx_clone);
+        let senders_clone = shared_senders.clone();
         let ring_clone = ring.clone();
         let response_sender_clone = response_sender.clone();
-        senders.push(tx);
 
         thread::spawn(move || {
-            node(id, rx, vec![tx_clone], response_sender_clone, version_vector, ring_clone);
+            node(id, rx, senders_clone, response_sender_clone, version_vector, ring_clone);
         });
     }
+
     senders
 }
-
 fn node(
     id: usize,
     receiver: Receiver<Message>,
-    senders: Vec<Sender<Message>>,
+    senders: Arc<Mutex<Vec<Sender<Message>>>>,
     response_sender: Sender<(usize, String)>,
     version_vector: Arc<Mutex<HashMap<usize, u64>>>,
     ring: Arc<Mutex<FxHashMap<u64, usize>>>,
@@ -83,15 +91,22 @@ fn node(
                             },
                         );
 
-                        for sender in &senders {
-                            sender.send(Message::Replicate {
-                                key: key.clone(),
-                                value: value.clone(),
-                                version: new_version_vector.clone(),
-                            }).unwrap();
-                        }
+                        {
+                            let mut sent_count = 1;
 
-                        print_local_state(id, local_db.clone());
+                            let mut senders = senders.lock().unwrap();
+                            let quorum_size = senders.len() / 2 + 1;
+                            while sent_count <= quorum_size {
+                                senders[(id + sent_count) % senders.len()].send(Message::Replicate {
+                                        key: key.clone(),
+                                        value: value.clone(),
+                                        version: new_version_vector.clone(),
+                                    }).unwrap();
+
+                                sent_count += 1;
+
+                            }
+                        }
                     },
                     Request::Read { key } => {
                         match local_db.get(&key) {
@@ -105,15 +120,20 @@ fn node(
                             },
                         }
                     },
+                    Request::Print {} => {
+                        print_local_state(id, local_db.clone());
+                    }
                 }
             },
             Message::Replicate { key, value, version } => {
                 if let Some(existing) = local_db.get(&key) {
-                    if !should_update(&existing.version, &version) {
-                        continue; // Skip this iteration, do not update
-                    } else {
+                    if should_update(&existing.version, &version) {
                         local_db.insert(key, Data { value, version });
+                    } else {
+                        println!("Node {} ignoring update for key {}", id, key)
                     }
+                } else {
+                    local_db.insert(key, Data { value, version });
                 }
 
             },
@@ -206,6 +226,7 @@ impl Request {
         match self {
             Request::Read { key } => key,
             Request::Write { key, value: _ } => key,
+            Request::Print {} => "",
         }
     }
 }
@@ -226,19 +247,28 @@ fn handle(
 
                     match json {
                         Ok(req) => {
-                            let key_hash = calculate_hash(&req.key());
-                            let node_id;
-                            {
-                                let ring = ring.lock().unwrap();
-                                node_id = ring.get_node(key_hash);
-                            }
+                            if req.key() == "" {
+                                for sender in &(*senders) {
+                                    sender.send(Message::ClientRequest {
+                                        client_id,
+                                        request: req.clone(),
+                                    }).unwrap();
+                                }
+                            } else {
+                                let key_hash = calculate_hash(&req.key());
+                                let node_id;
+                                {
+                                    let ring = ring.lock().unwrap();
+                                    node_id = ring.get_node(key_hash);
+                                }
 
-                            // Send the message to the node responsible for this key.
-                            let sender = &(*senders)[node_id].clone();
-                            sender.send(Message::ClientRequest {
-                                client_id,
-                                request: req.clone(),
-                            }).unwrap();
+                                // Send the message to the node responsible for this key.
+                                let sender = &(*senders)[node_id].clone();
+                                sender.send(Message::ClientRequest {
+                                    client_id,
+                                    request: req.clone(),
+                                }).unwrap();
+                            }
                         },
                         Err(err) => {
                             println!("Failed to parse JSON: {}", err);
@@ -305,7 +335,7 @@ impl HashRingTrait for FxHashMap<u64, usize> {
 }
 
 fn extract_client_id(stream: &TcpStream) -> usize {
-    let peer_addr = stream.peer_addr().unwrap().to_string(); // Getting the peer address as a string
+    let peer_addr = stream.peer_addr().expect("0.0.0.0"); // Getting the peer address as a string
 
     // Combine the peer address and the counter to create a "unique" client_id
     let client_id = format!("{}", peer_addr)

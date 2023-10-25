@@ -58,10 +58,12 @@ fn perform_operations(thread_id: usize, num_ops: usize) {
             println!("Guarantees met for thread {}", thread_id);
         }
     }
+
+    println!("Thread {} finished", thread_id);
 }
 
 pub fn run_client() {
-    let num_threads = 10;
+    let num_threads = 9;
     let num_ops_per_thread = 100;
     let mut handles = vec![];
 
@@ -75,4 +77,18 @@ pub fn run_client() {
     for handle in handles {
         handle.join().unwrap();
     }
+
+    send_print();
+}
+
+fn send_print() {
+    let mut stream = TcpStream::connect("127.0.0.1:8080").expect("Could not connect to server");
+    let print_payload = json!({
+            "type": "Print"
+        })
+        .to_string();
+
+    stream
+        .write_all(format!("{}\n", print_payload).as_bytes())
+        .expect("Failed to write to server");
 }
